@@ -1,0 +1,3939 @@
+这是我最近自己没事的时候写的一个服务端程序   
+采用了master+多个worker进程的进程模型,为了避免各个worker进程之间在最终程序退出时有内存泄露  我给每个worker进程都搞了一个内存池（这个是参考nginx的内存池设计的 原理不难）,因为每个worker进程打开的最大文件描述符数是限定的,所以我又搞了一个简易的连接池来管理连接.  至于多个worker进程在连接到来之时的惊群问题 ，我在master进程中预先打开一个文件锁,通过文件锁来控制worker进程之间的互斥,避免惊群。还有一个负载均衡的问题没有实现。。。。。。有空我会继续完善的。 
+
+
+
+
+负载均衡问题没有解决
+更新：
+   我更了connect.c connect.h还有event.c三个文件
+
+在我想解决系统如何检测网络节点超时的问题时,原来是想用个小根堆来解决之
+但是,网络连接的间隔时间小的可怜     于是乎   这个方案被pass了
+既然这样   我就从客户端入手(虽然还没写）
+
+就是给每个网络连接  我都对其设置发送和接收超时时延
+服务器端接收网络连接之后  我就发一个消息给客户端   让客户端来定时  
+如果客户端在固定时间内没有回复  就默认该连接失效   
+
+1.30
+
+上午   我对每个进程搞了一个最大文件描述符的接收标志, 如果到了该子进程的最大接收数量   标志就置1
+然后  下次竞争文件锁的时候   我这个进程就不去竞争了    让其他两个去竞争   
+
+还有一种情况就是客户端莫名其妙的崩掉了  没关系  服务器端的网络连接不是设置了接收时延 只要我发出去 你不回
+时间一到  我照样回收网络连接节点
+
+下阶段任务:
+  把日志记录也搞进去  (这个不是特别难 关键是多个参数的录入涉及到一个多个参数参数（参数个数未知））
+ 
+标签： <无>
+代码片段(19)[全屏查看所有代码]
+
+1. [文件] log.c ~ 1KB     下载(16)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+#include"log.h"
+ 
+/*我们的日志文件是以时间为文件名后缀名为.log*/
+static  int  get_logfile_name(struct  serverinfo  *server)
+{
+    time_t  rtime;
+    struct   tm    *temp;
+    rtime=time(NULL);
+    temp=localtime(&rtime);
+    //这个最好搞个时间缓存;用于记录创建日志的时间;
+    snprintf(server->logfilename,sizeof(server->logfilename),"%d-%d-%d.log",temp->tm_year+1900,temp->tm_mon+1,temp->tm_mday);
+    return    1;
+}
+ 
+/*根据日志路径创建相应的日志文件;*/
+int  create_log_file(struct   serverinfo  *server,char  *path,char*startpath)
+{
+    int   exist_flag;
+    int   fd;
+    if(chdir(path)<0)
+    {
+        //打印错误信息  然后退出;
+    }
+    else
+    {
+        get_logfile_name(server);
+        exist_flag=access(server->logfilename,F_OK);  //判断日志文件是否存在;
+        if(exist_flag<0)
+        {
+            if((fd=open(server->logfilename,O_RDWR|O_CREAT|O_APPEND,0644))<0)
+            {
+                //打印错误信息;
+ 
+            }
+            printf("系统日志文件%s创建成功!\n",server->logfilename);
+        }
+        else
+        {
+            fd=open(server->logfilename,O_RDWR|O_APPEND,0644);
+            if(fd<0)
+            {
+               perror("open");
+            }
+            printf("系统日志文件%s已经存在!\n",server->logfilename);
+ 
+        }
+        chdir(startpath); //返回到当前目录下;
+    }
+    return  fd;//返回日志文件的描述符;
+}
+ 
+/*日志记录*/
+2. [文件] mempool.c ~ 3KB     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+#include"mempool.h"
+ 
+/*
+ *初始化内存池结构;
+ */
+mempool  *  mempool_init(mempool * pool,size_t  size)
+{
+    size_t    esize=size?size:PAGE_SIZE;
+    if(!(pool=(mempool *)malloc(esize)))
+    {
+        perror("pool init  error!\n");
+        return   NULL;
+    }
+ 
+    pool->epsize=esize-sizeof(mempool);
+    pool->data.last=(unsigned char*)pool+sizeof(mempool);
+    pool->data.end=(unsigned char*)pool+size;
+    pool->data.next=NULL;
+    pool->data.failedflag=0;
+    pool->large=NULL;
+    pool->data.memID=1;
+    pool->current=pool;
+    printf("worker进程PID:%d---内存池初始化成功!\n",getpid());
+    return   pool;
+}
+ 
+/*重新申请一块小内存*/
+void  * mempool_block_alloc(mempool  *pool,size_tsize)
+{
+    size_t  esize;
+    void    *m;
+    mempool *p,*temp,*q;
+    esize=(size_t)pool->data.end-(size_t)pool;
+    size+=ALIGN_DEFAULT-ALIGN_DEFAULT%esize;
+    if(!(m=malloc(esize)))
+    {
+        perror("malloc  block  error!\n");
+        return    NULL;
+    }
+    p=(mempool *)m;
+    p->epsize=esize;
+    p->large=NULL;
+    p->data.next=NULL;
+    m+=sizeof(struct  mempool_data);
+    p->data.end=m+p->epsize;
+    p->data.last=m+size;
+    //插入链表;
+    temp=pool->current;
+    for(q=temp;q->data.next!=NULL;q=q->data.next)
+    {
+ 
+    }
+    q->data.next=p;
+    p->data.memID=q->data.memID+1;
+    pool->current=temp?temp:p;
+    printf("申请了新的内存块!MEMID:%d\n",p->data.memID);
+    return  m;
+}
+ 
+/*重新申请一块大内存区域*/
+void  * mempool_large_block_alloc(mempool *pool,size_tsize)
+{
+    void  *m;
+    struct   mempool_large_t   *p;
+    size+=ALIGN_DEFAULT-(ALIGN_DEFAULT%size);
+    m=(void*)malloc(size);
+    if(!m)
+    {
+        perror("large  malloc");
+        return  NULL;
+    }
+    for(p=pool->large;p;p=p->next)
+    {
+        if(p->alloc==NULL)
+        {
+            p->alloc=m;
+            return   m;
+        }
+    }
+    //插入链表;
+    if(!(p=(struct  mempool_large_t *)mempool_alloc(pool,sizeof(struct  mempool_large_t))))
+    {
+        perror("malloc  errorr \n");
+        return  NULL;
+    }
+    p->alloc=m;
+    p->next=pool->large;
+    pool->large=p;
+    return  m;
+}
+ 
+/*申请一块内存*/
+void  * mempool_alloc(mempool *pool,size_t  size)
+{
+    mempool *p=pool->current;
+    void  *ptr;
+    if(size<=p->epsize)
+    {
+        size+=ALIGN_DEFAULT-(size%ALIGN_DEFAULT);
+        do
+        {
+            ptr=p->data.last;
+            if(size<=(size_t)p->data.end-(size_t)p->data.last)
+            {
+                p->data.last=ptr+size;
+                return  ptr;
+            }
+            p=p->data.next;
+        }while(p);
+        return    mempool_block_alloc(pool,size);
+    }
+    return    mempool_large_block_alloc(pool,size);
+}
+ 
+/*内存池销毁*/
+void   destroy_mem_pool(mempool *pool)
+{
+   //首先释放大内存;
+   struct  mempool_large_t  * p;
+   mempool  *  q,* temp;
+   p=pool->large;
+   void*m;
+   for(;p;p=p->next)
+   {
+       if(p->alloc)
+       {
+           m=p->alloc;
+           free(m);
+           p->alloc=NULL;
+       }
+   }
+   //然后释放小内存块;
+   for(q=pool,temp=q->data.next;;q=temp,temp=temp->data.next)
+   {
+       free(q);
+       if(temp==NULL)
+           break;
+   }
+ 
+}
+3. [文件] queue.c ~ 2KB     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+#include"queue.h"
+#include"server.h"
+#include"mempool.h"
+/*比较用户名是否相同*/
+int  nameswitch(char*elm1,char*elm2)
+{
+    int   ret;
+    int  len1,len2;
+    if(elm1==NULL||elm2==NULL)
+    {
+        perror("elm  is  null!\n");
+        return  -1;
+    }
+    len1=strlen(elm1);
+    len2=strlen(elm2);
+    if(len1!=len2)
+    {
+        return  2;
+    }
+    else
+    {
+        ret=strncmp(elm1,elm2,len1);
+        if(ret==0)
+            return  1;
+        else
+            return  2;
+    }
+}
+/*初始化双向队列*/
+struct   userinfo  *  queue_init(struct   userinfo  * head,int  index)
+{
+    if(!(head=(struct  userinfo *)mempool_alloc(server->process[index].mem_pool,sizeof(struct  userinfo))))
+    {
+        perror("malloc error");
+        return  NULL;
+    }
+    head->next=head;
+    head->prev=head;
+    return  head;
+}
+/*插入节点到链表操作*/
+int   queue_insert_node(struct  userinfo  *head, struct  userinfo  *elm)
+{
+    if(elm==NULL)
+    {
+        perror("elm is null!\n");
+        return  -1;
+    }
+    elm->next=head->next;
+    head->next=elm;
+    elm->prev=head;
+    if(head->next==head)
+    {
+       head->prev=elm;
+    }
+    return    1;
+}
+ 
+/*删除链表节点操作*/
+int  queue_remove_node(struct  userinfo  *head,struct  userinfo  *elm)
+{
+   int   ret;
+   int   flag=0;
+   struct   userinfo  *  temp;
+   struct   userinfo  *  tempprev;
+   if(elm==NULL)
+   {
+       perror("elm  is null!\n");
+       return  -1;
+   }
+   else
+   {
+      tempprev=head->prev;
+      temp=head->next;
+      while(temp!=head)
+      {
+          //比较用户名是否相同;
+          ret=nameswitch(temp->name,elm->name);
+          if(ret==1)
+          {
+             flag=1;
+             tempprev->next=temp->next;
+             temp->next->prev=tempprev;
+             printf("删除成功!\n");
+             free(temp);
+             return  1;
+          }
+          tempprev=temp;
+          temp=temp->next;
+      }
+      if(flag==0)
+      {
+          perror("elm  is  not found!\n");
+          return  2;
+      }
+   }
+}
+ 
+/*
+ *遍历链表;
+ */
+void  display_queue_info(struct  userinfo  * head)
+{
+    struct   userinfo  *temp;
+    temp=head->next;
+    while(temp!=head)
+    {
+        printf("-----------------用户信息---------------\n");
+        printf("用户名:%s\n", temp->name);
+        printf("用户密码:%s\n",temp->passwd);
+        printf("用户年龄:%d\n",temp->year);
+        printf("客户端的ip地址:%s\n",temp->ipaddr);
+        printf("----------------------------------------\n");
+        temp=temp->next;
+    }
+}
+4. [文件] signalex.c ~ 1KB     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+#include"signalex.h"
+#include"msgprocess.h" 
+/*信号组的静态初始化*/
+struct    signal_value   signals[]=
+{
+    {SIGINT,"SIGINT",signal_happen_handler},
+    {SIGQUIT,"SIGQUIT",signal_happen_handler},
+    {SIGCHLD,"SIGCHID",signal_happen_handler},
+    {COMM_RESTART,"COMM_RESTART",signal_happen_handler},
+    {COMM_DISPLAY_SERVER,"COMM_DISPLAY_SERVER",signal_happen_handler},
+};
+ 
+/*初始化绑定master进程的信号*/
+int   signal_set_init(struct  sigaction  *act)
+{
+    struct     signal_value    *signum=NULL;
+    for(signum=signals;signum->signo!=0;signum++)
+    {
+        act->sa_handler=signal_happen_handler;
+        act->sa_flags|=SA_RESTART;
+        sigemptyset(&act->sa_mask);
+        if(sigaction(signum->signo,act,NULL)<0)
+        {
+            return   -1;
+        }
+    }
+    return  1;
+}
+ 
+ 
+/*把绑定的信号和命令添加至当前信号集中*/
+int   add_signal_to_master_process_set( sigset_t  *set)
+{  
+    sigemptyset(set);
+    //添加信号初始化的信号到当前进程;
+    if(sigaddset(set,SIGINT)<0)
+    {
+       return  -1;
+    }
+    if(sigaddset(set,SIGQUIT)<0)
+    {
+       return  -1;
+    }
+    if(sigaddset(set,SIGCHLD)<0)
+    {
+       return  -1;
+    }
+    if(sigaddset(set,COMM_RESTART)<0)
+    {
+       return  -1;
+    }
+    if(sigaddset(set,COMM_DISPLAY_SERVER)<0)
+    {
+        return-1;
+    }
+    if(sigprocmask(SIG_BLOCK,&server->set,NULL)<0)
+    {
+        return  -1;
+    }
+    sigemptyset(&server->set);//初始化下;
+    return  1;
+}
+5. [文件] file_mutex.c ~ 1KB     下载(13)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+#include"file_mutex.h"
+ 
+/*打开一个文件用于文件锁*/
+int   server_open_file_mutex(struct  file_mutex_t *file )
+{
+ 
+    file->fd=open("/dev/null",O_RDWR,0644);
+    if(file->fd<0)
+    {
+        perror("open file_mutex error!\n");
+        return  -1;
+    }
+    snprintf(file->filename,sizeof("/dev/null"),"%s","/dev/null");
+    printf("主进程打开锁文件%s成功!\n",file->filename);
+    return  1;
+}
+ 
+/*加锁*/
+int   worker_process_lock_set(structfile_mutex_t  *file)
+{
+    struct   flock   fl;
+    fl.l_type=F_WRLCK; //独占锁;
+    fl.l_whence=SEEK_SET;
+    fl.l_start=0;
+    fl.l_len=0;
+    fl.l_pid=getpid();
+    if(fcntl(file->fd,F_GETLK,&fl)<0)
+    {
+        perror("worker  process set  filelock  successfully!\n");
+        return  -1;
+    }
+    printf("进程PID:%d获取锁成功!\n",getpid());
+    return   1;
+}
+ 
+ 
+ 
+/*解锁*/
+int   worker_process_unlock_set(structfile_mutex_t  *file)
+{
+   struct    flock  fl;
+   fl.l_type=F_UNLCK;
+   fl.l_whence=SEEK_SET;
+   fl.l_start=0;
+   fl.l_len=0;
+   fl.l_pid=getpid();
+   if(fcntl(file->fd,F_SETLK,&fl)<0)
+   {
+       perror("worker  process  realease  filelock  failure!\n");
+       return  -1;
+   }
+   printf("进程PID:%d 释放锁成功!\n",getpid());
+   return   1;
+}
+6. [文件] queue.h ~ 817B     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+#ifndef  _QUEUE_H_
+#define  _QUEUE_H_
+#include<stdio.h>
+#include<stdlib.h>
+#include<errno.h>
+#include<netinet/ip.h>
+#include<netinet/in.h>
+#include<string.h>
+/*
+ *每个用户的用户要素;
+ */
+struct  userinfo
+{
+   char  name[50];
+   char  passwd[20];
+   int   year;
+   char  ipaddr[20];
+   struct   sockaddr_in  serveraddr;   //ip地址;
+   short    serverport;                //ip端口;
+   int      fd;                       
+   struct   userinfo  *next;
+   struct   userinfo  *prev;
+};
+ 
+ 
+int  nameswitch(char*elm1,char*elm2);
+struct   userinfo  *  queue_init(struct   userinfo  * head,int  index);
+int   queue_insert_node(struct  userinfo  *head, struct  userinfo  *elm);
+int  queue_remove_node(struct  userinfo  *head,struct  userinfo  *elm);
+void  display_queue_info(struct  userinfo  * head);
+ 
+ 
+ 
+#endif
+7. [文件] log.h ~ 261B     下载(13)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+#ifndef  __LOG_H__
+#define  __LOG_H__
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include"server.h"
+int  create_log_file(struct   serverinfo  *server,char  *path,char*startpath);
+static  int  get_logfile_name(struct  serverinfo  *server);
+#endif
+8. [文件] signalex.h ~ 405B     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+#ifndef _SIGNALEX_H__
+#define _SIGNALEX_H__
+#include<stdio.h>
+#include<stdlib.h>
+#include<signal.h>
+#include<arpa/inet.h>
+ 
+struct   signal_value
+{
+    int  signo;   //信号值;
+    char*signame;//信号名称;
+    void(*signal_handler)(int  sig);
+};
+ 
+void   signal_happen_handler(int  sig);
+int   signal_set_init(struct  sigaction  *act);
+int   add_signal_to_master_process_set( sigset_t  *set);
+#endif
+9. [文件] server.h ~ 2KB     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+#ifndef  _SERVER_H__
+#define  _SERVER_H__
+ 
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<sys/types.h>
+#include<sys/socket.h>
+#include<fcntl.h>
+#include<unistd.h>
+#include<netinet/in.h>
+#include<netinet/ip.h>
+#include<sys/stat.h>
+#include<sys/epoll.h>
+#include<dirent.h>
+#include"queue.h"
+#include<signal.h>
+#include<arpa/inet.h>
+#include<string.h>
+#include<sched.h>
+#include<getopt.h>
+#include<time.h>
+#include"mempool.h"
+#include"file_mutex.h"
+ 
+#define     BUFSIZE   200
+#define     BACKLOG   2048
+#define     MASTER_PROCESS  0x01
+#define     WORKER_PROCESS  0x02
+#define    _DAEMONE_        0x03
+ 
+ 
+/*
+ *进程表;
+ */
+struct   processinfo
+{
+    int     epfd;
+    pid_t   pid;//进程pid号;
+    int     slot; //当前进程在进程表中的索引号;
+    int   channel[2];
+    int     recvflag;
+    //存放用户信息的链表(在线用户)
+    struct   userinfo  *head;
+    //注册用户信息;可以用数据库来搞吧;
+    //业务处理函数
+    sigset_t   set;
+    void  *data;  //传入回调函数的参数;
+    void(*worker_process_handler)(void*data);
+    struct  connect_pool   *pool;
+    mempool    * mem_pool;
+};
+/*
+ *服务器要素;
+ */
+struct   serverinfo
+{
+   char  servername[100];
+   int   listenfd;
+   int   epfd;
+   pid_t   pid;
+   char  main_path[100];
+   char  serverip[20];
+   structsockaddr_in  serveraddr;
+   short  serverport;
+   int    currentprocessnum;   //当前进程数目;
+   //进程表;
+   structprocessinfo  *process;
+   int    logfd;  //日志文件;
+   int    logchangeflag;
+   char   log_path[100];
+   int    processnum;
+   struct  file_mutex_t  file;
+   char   logfilename[50]; 
+   sigset_t   set; //信号集;
+   struct   sigaction  act;
+  
+};
+ 
+struct   serverinfo   *server;
+ 
+int    server_daemon();
+int    switch_server_ini(struct   serverinfo  * server,char  * buf);
+char* scan_local_dir(char*path);
+int    read_server_ini(struct  serverinfo  *server,char*path);
+int    add_epoll_event(struct  serverinfo  *server,int  sockfd,int  index,int  type);
+structserverinfo  *server_init(struct  serverinfo *server,char*path,intargc,char**argv,char*startpath);
+int    find_worker_process_idle(struct  serverinfo  * server);
+int    setsocketnonblocking(int   socket);
+int    setsocketexecclose(int  socket);
+void   worker_process_cycle_handler(void  *data);
+int    create_worker_process(struct  serverinfo  *server);
+int    master_process_para_args(struct   serverinfo  *server,int  argc,char*argv[],char*startpath);
+ 
+ 
+#endif
+10. [文件] msgprocess.h ~ 2KB     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+#ifndef  _MSG_PROCESS_H__
+#define  _MSG_PROCESS_H__
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<time.h>
+#include"queue.h"
+#include"server.h"
+#define  MESSAGE_MAX_SIZE   512
+#define  EPOLL_EVENT_MAXSiZE   1024
+ 
+ 
+ 
+//消息类型定义
+ 
+#define   SEND_FILE_DES     0x01    //传递文件描述符;
+#define   SEND_SIG_NO       0x02    //发送信号;
+#define   SEND_DATA_MESSAGE 0x03   //发送数据信息;
+#define   SERVER_COMM       0x04
+ 
+#define  COMM_RESTART         0x10  //重启;
+#define  COMM_DISPLAY_SERVER  0x12   //显示服务情况;
+ 
+struct   command
+{
+    int   type;   //消息类型;
+    int   msgcode;
+    char  *name;
+    int   fd; //接收套接字;
+};
+ 
+struct    message
+{ 
+    int   type;      //消息类型定义;
+    int   slot;      //发送方的索引号;
+    int   senddrt;   //发送方向;
+    pid_t srcpid;    //发送消息的pid号;
+    pid_t dstpid;    //接收消息的pid号;
+    char  name[50];  //发送者姓名;
+    struct  timeval  tv; //时间;
+    size_t  len;      //本次消息长度;
+    int   overflag;   //消息的结束标志;
+    char  msgbuf[MESSAGE_MAX_SIZE];//发送的数据;
+};
+ 
+ 
+ 
+int   worker_process_socket_register(struct  serverinfo   *server,int  index, int  fd);
+int   send_socketfd_to_workerprocess(struct  serverinfo  *server, int  index,struct command *smsg,size_t   smsglen);
+int   sendmessage(struct   serverinfo *server,int  index,struct  message *msg,size_t  msglen);
+int   recv_socketfd_from_masterprocess(struct  serverinfo * server,int   index, struct  command  *rmsg,size_t  rmsglen);
+int   recvmessage(struct   serverinfo *server,intindex,struct  message  *msg, size_t  msglen);
+int   worker_process_recv_comm_signal_handler(structserverinfo  *server,int  index);
+int   worker_process_handler_comm_siganl(struct  serverinfo *server,int  index);
+int    command_and_signo_send(struct  serverinfo *server,struct  command   *comm,size_tsize);
+#endif
+11. [文件] mempool.h ~ 1KB     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+#ifndef  _MEM_POOL_H__
+#define  _MEM_POOL_H__
+ 
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+ 
+#define    PAGE_SIZE    4096  
+#define    ALIGN_DEFAULT   8
+ 
+ 
+typedef   struct  mempool_t   mempool; 
+ 
+/*
+ *内存池的小内存块结构体定义;
+ */
+struct  mempool_data
+{
+  unsigned  char  *last;
+  unsigned  char  *end;
+  mempool         *next;
+  int             failedflag;
+  size_t          memID;      //memID号;
+ 
+};
+ 
+/*内存池的大内存块的结构体定义*/
+struct  mempool_large_t  
+{
+    struct  mempool_large_t   *next;
+    void   *alloc;
+    size_t    memID;    //memID号;
+};
+ 
+/*内存池的结构*/
+struct  mempool_t
+{
+  struct  mempool_data  data;  //内存池的数据区;
+  size_t    epsize;            //第一个小内存块的有效长度;
+  struct    mempool_large_t    *large; //大内存区域;
+  mempool  *   current;//当前的内存块;
+ 
+};
+ 
+void  * mempool_alloc(mempool *pool,size_t  size);
+mempool  * mempool_init(mempool * pool,size_t  size);
+void  * mempool_large_block_alloc(mempool *pool,size_tsize);
+void   destroy_mem_pool(mempool *pool);
+ 
+#endif
+12. [文件] server.ini ~ 143B     下载(8)     
+
+13. [文件] file_mutex.h ~ 472B     下载(12)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+/*
+ *用文件锁来控制进程间的惊群;
+ *
+ */
+#ifndef  _FILE_MUTEX_H__
+#define  _FILE_MUTEX_H__
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<fcntl.h>
+#include<unistd.h>
+ 
+/*
+ *文件锁;
+ */
+struct  file_mutex_t
+{
+    int     fd;
+    char    filename[50];
+};
+ 
+ 
+ 
+int   server_open_file_mutex(struct  file_mutex_t *file);
+int   worker_process_lock_set(struct  file_mutex_t  *file);
+int   worker_process_unlock_set(struct   file_mutex_t  *file);
+ 
+#endif
+14. [文件] msgprocess.c ~ 4KB     下载(7)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+152
+153
+154
+155
+156
+157
+158
+159
+160
+161
+162
+163
+164
+165
+166
+167
+168
+169
+170
+171
+172
+173
+174
+175
+176
+177
+178
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+191
+#include"msgprocess.h"
+#include"signalex.h"
+static  sig_atomic_t  sigint=0;
+static  sig_atomic_t  sigquit=0;
+static  sig_atomic_t  comrestart=0;
+ 
+/*worker进程登记其他worker进程套接字的函数接口*/
+int   worker_process_socket_register(struct  serverinfo   *server,int  index, int  fd)
+{
+    int  i,j;
+    for(i=index+1;i<server->processnum;i++)
+    {
+        for(j=0;j<2;j++)
+        {
+            if(server->process[i].channel[j]==0)
+            {
+               server->process[i].channel[j]=fd;
+               if(i==server->processnum-1&&j)
+               {
+                  server->process[index].recvflag=1;
+               }
+               return   1;
+            }
+            else
+               continue;
+        }
+    }
+    return  1;
+}
+ 
+/*发送文件描述函数*/
+int   send_socketfd_to_workerprocess(struct  serverinfo  *server, int  index,struct command *smsg,size_t   smsglen)
+{
+     struct  msghdr    msg;
+     struct  iovec    iov[1];
+     size_t  n;
+     union
+     {
+        struct    cmsghdr   cm;
+        char      data[CMSG_SPACE(sizeof(int))];
+     }cmsg;
+     msg.msg_name=NULL;
+     msg.msg_namelen=0;
+ 
+     iov[0].iov_base=(char*)smsg;
+     iov[0].iov_len=smsglen;
+       
+     msg.msg_control=(void*)&cmsg;
+     msg.msg_controllen=sizeof(cmsg);
+ 
+     cmsg.cm.cmsg_len=CMSG_LEN(sizeof(int));
+     cmsg.cm.cmsg_level=SOL_SOCKET;
+     cmsg.cm.cmsg_type=SCM_RIGHTS;
+ 
+     msg.msg_flags=0;
+     memcpy(CMSG_DATA(&cmsg.cm),&smsg->fd,sizeof(int));
+     msg.msg_iov=iov;
+     msg.msg_iovlen=1;
+     n=sendmsg(server->process[index].channel[1],&msg,0);
+     if(n==-1)
+     {
+         if(errno==EAGAIN)
+         {
+             return  2;
+         }
+         return  -1;
+     }
+     return    1;
+}
+   
+ 
+ 
+ 
+ 
+ 
+/*发送消息*/
+int    sendmessage(struct   serverinfo *server,int  index,struct  message *msg,size_t  msglen)
+{
+    switch(msg->type)
+    {
+      case  SEND_DATA_MESSAGE:
+                         
+            break;
+      default:
+            perror("unknown  message  type!\n");
+            return  0;
+    }
+    return  1;
+}
+ 
+/*接收文件描述符函数*/
+int   recv_socketfd_from_masterprocess(struct  serverinfo * server,int   index, struct  command  *rmsg,size_t  rmsglen)
+{
+    struct  msghdr  msg;
+    struct  iovec  iov[1];
+    size_t      n;
+    union
+    {
+        struct  cmsghdr   cm;
+        char    data[CMSG_SPACE(sizeof(int))];
+    }cmsg;
+    msg.msg_name=NULL;
+    msg.msg_namelen=0;
+    iov[0].iov_base=(void*)rmsg;
+    iov[0].iov_len=rmsglen;
+    msg.msg_iov=iov;
+    msg.msg_iovlen=1;
+    msg.msg_control=(void*)&cmsg;
+    msg.msg_controllen=sizeof(cmsg);
+    n=recvmsg(server->process[index].channel[0],&msg,0);
+    if(n==-1)
+    {
+        if(errno==EAGAIN)
+        {
+            return   2;
+        }
+        return   -1;
+    }
+    memcpy(&rmsg->fd,CMSG_DATA(&cmsg.cm),sizeof(int));
+    if(rmsg->type==SEND_FILE_DES)
+         worker_process_socket_register(server,index,rmsg->fd);
+    return   1;
+}
+ 
+/*接收消息*/
+int    recvmessage(struct   serverinfo *server,intindex,struct  message  *msg,size_t  msglen)
+{
+     switch(msg->type)
+     {
+            
+       caseSEND_DATA_MESSAGE:
+            break;
+       default:
+            perror("unknown  message  type!\n");
+            return  0;
+     }
+     return  1;  
+}
+ 
+int   worker_process_exit_handler(struct  serverinfo  * server,int  index)
+{
+     
+     destroy_mem_pool(server->process[index].mem_pool);//注册清理回调回调函数;
+     destroy_worker_process_conn_pool(server->process[index].pool);
+     close(server->file.fd);
+     close(server->logfd);
+     free(server->process);
+     free(server);
+     exit(0); 
+}
+ 
+//worker进程接收到信号或者命令之后的处理;
+int   worker_process_recv_comm_signal_handler(structserverinfo  *server,int  index)
+{
+ 
+    if(server->process[index].recvflag==0)
+    {
+        worker_process_recv_socket(server,index);
+        return   1;
+    }
+    printf("server->process[%d].recvflag=%d\n",index,server->process[index].recvflag);
+    struct  command   comm;
+    memset(&comm,0,sizeof(comm));
+    int  ret;
+    ret=read(server->process[index].channel[0],&comm,sizeof(comm));
+    if(ret<0)
+    {
+        perror("recv");
+        return  -1;
+    }
+    switch(comm.msgcode)
+    {
+    case  SIGINT:
+          sigint=1;
+          printf("接收到了信号%d\n",SIGINT);
+          break;
+    case  SIGQUIT:
+          sigquit=1;
+          printf("接收到了安全退出的信号!\n");
+          worker_process_exit_handler(server,index);
+          break;
+    case  COMM_RESTART:
+          comrestart=1;
+          printf("接收到了重新启动的命令!\n");
+          break;
+    default:
+          printf("unknown  msgcode  can be known!PID:%d\n",getpid());
+          return-1;
+    }
+    return   1;
+}
+15. [文件] server.c ~ 16KB     下载(7)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+152
+153
+154
+155
+156
+157
+158
+159
+160
+161
+162
+163
+164
+165
+166
+167
+168
+169
+170
+171
+172
+173
+174
+175
+176
+177
+178
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+191
+192
+193
+194
+195
+196
+197
+198
+199
+200
+201
+202
+203
+204
+205
+206
+207
+208
+209
+210
+211
+212
+213
+214
+215
+216
+217
+218
+219
+220
+221
+222
+223
+224
+225
+226
+227
+228
+229
+230
+231
+232
+233
+234
+235
+236
+237
+238
+239
+240
+241
+242
+243
+244
+245
+246
+247
+248
+249
+250
+251
+252
+253
+254
+255
+256
+257
+258
+259
+260
+261
+262
+263
+264
+265
+266
+267
+268
+269
+270
+271
+272
+273
+274
+275
+276
+277
+278
+279
+280
+281
+282
+283
+284
+285
+286
+287
+288
+289
+290
+291
+292
+293
+294
+295
+296
+297
+298
+299
+300
+301
+302
+303
+304
+305
+306
+307
+308
+309
+310
+311
+312
+313
+314
+315
+316
+317
+318
+319
+320
+321
+322
+323
+324
+325
+326
+327
+328
+329
+330
+331
+332
+333
+334
+335
+336
+337
+338
+339
+340
+341
+342
+343
+344
+345
+346
+347
+348
+349
+350
+351
+352
+353
+354
+355
+356
+357
+358
+359
+360
+361
+362
+363
+364
+365
+366
+367
+368
+369
+370
+371
+372
+373
+374
+375
+376
+377
+378
+379
+380
+381
+382
+383
+384
+385
+386
+387
+388
+389
+390
+391
+392
+393
+394
+395
+396
+397
+398
+399
+400
+401
+402
+403
+404
+405
+406
+407
+408
+409
+410
+411
+412
+413
+414
+415
+416
+417
+418
+419
+420
+421
+422
+423
+424
+425
+426
+427
+428
+429
+430
+431
+432
+433
+434
+435
+436
+437
+438
+439
+440
+441
+442
+443
+444
+445
+446
+447
+448
+449
+450
+451
+452
+453
+454
+455
+456
+457
+458
+459
+460
+461
+462
+463
+464
+465
+466
+467
+468
+469
+470
+471
+472
+473
+474
+475
+476
+477
+478
+479
+480
+481
+482
+483
+484
+485
+486
+487
+488
+489
+490
+491
+492
+493
+494
+495
+496
+497
+498
+499
+500
+501
+502
+503
+504
+505
+506
+507
+508
+509
+510
+511
+512
+513
+514
+515
+516
+517
+518
+519
+520
+521
+522
+523
+524
+525
+526
+527
+528
+529
+530
+531
+532
+533
+534
+535
+536
+537
+538
+539
+540
+541
+542
+543
+544
+545
+546
+547
+548
+549
+550
+551
+552
+553
+554
+555
+556
+557
+558
+559
+560
+561
+562
+563
+564
+565
+566
+567
+568
+569
+570
+571
+572
+573
+574
+575
+576
+577
+578
+579
+580
+581
+582
+583
+584
+585
+586
+587
+588
+589
+590
+591
+592
+593
+594
+595
+596
+597
+598
+599
+600
+601
+602
+603
+604
+605
+606
+607
+608
+609
+610
+611
+612
+613
+614
+615
+616
+617
+618
+619
+620
+621
+622
+623
+624
+625
+626
+627
+628
+629
+630
+631
+632
+633
+634
+635
+636
+637
+638
+639
+640
+641
+642
+643
+644
+645
+646
+647
+648
+649
+650
+651
+652
+653
+654
+655
+656
+657
+658
+659
+660
+661
+662
+663
+664
+665
+666
+667
+668
+669
+670
+671
+672
+673
+674
+675
+676
+677
+678
+679
+680
+681
+682
+683
+684
+685
+686
+687
+688
+689
+690
+691
+692
+693
+694
+695
+696
+697
+698
+699
+700
+701
+702
+703
+704
+705
+706
+707
+708
+709
+710
+711
+712
+713
+714
+715
+716
+717
+718
+719
+720
+721
+722
+723
+724
+725
+726
+727
+728
+729
+730
+731
+732
+733
+734
+735
+736
+737
+738
+739
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+756
+757
+758
+759
+760
+#include"server.h"
+#include"msgprocess.h"
+#include"connect.h"
+#include"signalex.h"
+#include"event.h"
+ 
+sig_atomic_t      sigint=0;  //这种数据类型是原子性;
+sig_atomic_t      sigchild=0;
+sig_atomic_t      sigquit=0;
+sig_atomic_t      comrestart=0;
+sig_atomic_t      comdisplay=0;
+ 
+//解析命令行参数需要改变的一些标志位;
+int     do_help=0;
+int     do_version=0;
+int     err_flag=0;
+int     server_debug=0;
+ 
+static   struct   option    longoption[]=
+{
+    {"debug",no_argument,NULL,'d'},
+    {"record",optional_argument,NULL,'r'},
+    {"dohelp",no_argument,NULL,'h'},
+    {"do_verion",no_argument,NULL,'v'},
+    {0,0,0,0}
+};
+ 
+ 
+//系统帮助函数;
+int  server_help(void)
+{
+    printf("---------------help-----------------\n");
+    printf("-h     获取帮助                     \n");
+    printf("-v     当前版本号                   \n");
+    printf("-r     修改日志存放路径             \n");
+    printf("-d     打印调试信息                 \n");
+    printf("------------------------------------\n");
+    exit(0);
+}
+//显示当前的版本号;
+int   server_version_show(void)
+{
+    printf("系统版本:0.0.1\n");
+    exit(0);
+}
+ 
+/*解析命令行参数*/
+int  master_process_para_args(struct  serverinfo *server,int  argc,char**argv,char*startpath)
+{
+    char  c;
+    while((c=getopt_long(argc,argv,"dhvr:",longoption,NULL))!=-1)
+    {
+        switch(c)
+        {
+        case'd':
+            server_debug=1;
+            break;
+        case'r':
+            if(optarg)
+            {
+                memset(server->log_path,0,sizeof(server->log_path));
+                memcpy(server->log_path,optarg,strlen(optarg));
+                server->logchangeflag=1;
+                printf("当前日志路径被修改为:%s\n",server->log_path);
+            }
+            break;
+        case'h':
+            do_help=1;
+            break;
+        case'v':
+            do_version=1;
+            break;
+        case'?':
+        default:
+            break;
+        case':':
+            err_flag=1;
+            break;
+        }
+    }
+    if(do_help)
+    {
+        //显示帮助函数;
+        server_help();
+    }
+    if(do_version)
+    {
+        //显示当前的版本号;
+        server_version_show();
+    }
+    if(err_flag)
+    {
+        //解析出现错误的时候;
+ 
+    }
+    if(server_debug)
+    {
+        //进入调试模式;
+    }
+    if(server->logchangeflag)
+    {
+        //创建相应的日志文件;
+        server->logfd=create_log_file(server,server->log_path,startpath);
+    }
+    return    1;
+}
+/*绑定相应的进程到CPU核心上 因为本地是只有一个CPU核心就不绑定了!*/
+int  set_cpu_affinity(pid_t  pid,unsigned  long   mask)
+{
+    unsigned  int  len=sizeof(mask);
+    if(sched_setaffinity(pid,len,&mask)<0)
+    {
+        perror("sched_setaffinity");
+        return  -1;
+    }
+    printf("%d绑定成功!\n",pid);
+}
+ 
+/*信号触发处理函数*/
+void   signal_happen_handler(int  sig)
+{
+    switch(sig)
+    {
+    case   SIGINT: 
+        sigint=1;
+        printf("接收到%d信号!\n",SIGINT);
+        break;
+    case   SIGQUIT: //这个信号是安全退出;
+        sigquit=1;
+        printf("接收到%d信号!\n",SIGQUIT);
+        break;
+    case   SIGCHLD:
+        printf("接收到%d信号!\n",SIGCHLD);
+        sigchild=1;
+        break;
+    case   COMM_RESTART:
+        printf("接收到%d命令!\n",COMM_RESTART);
+        comrestart=1;
+        break;
+    case   COMM_DISPLAY_SERVER:
+        printf("接收到%d命令!\n",COMM_DISPLAY_SERVER);
+        comdisplay=1;
+        break;
+    default:
+        signal(sig,SIG_IGN);
+        break;
+    }
+}
+/*
+ *服务器配置文件里的要素数组;
+ */
+char  *server_ini_info[]=
+{
+    "SERVER_NAME",
+    "WORK_PATH",
+    "SERVER_IP",
+    "SERVER_PORT",
+    "LOG_PATH",
+    "PROCESS_NUM",
+};
+ 
+/*
+ *服务器程序后台化;
+ */
+int    server_daemon()
+{
+    int   i;
+    pid_t   pid;
+    pid=fork();
+    if(pid<0)
+    {
+        perror("fork");
+        return  -1;
+    }
+    elseif(pid>0)
+    {
+        exit(0);
+    }
+    if(setsid()<0)
+    {
+        perror("setsid error");
+        return-1;
+    }
+    pid=fork();
+    if(pid<0)
+    {
+        perror("fork error");
+        return  -1;
+    }
+    elseif(pid>0)
+    {
+        exit(0);
+    }
+    chdir("/");
+    for(i=0;i<3;i++)
+    {
+        close(i);
+    }
+    umask(0);
+    return   1;
+}
+ 
+/*
+ *匹配配置文件的的配置项;
+ */
+int    switch_server_ini(struct   serverinfo  * server,char  * buf)
+{
+    int  i,j,len;
+    char*temp;
+    for(i=0;temp=server_ini_info[i];i++)
+    {
+        len=strlen(temp);
+        if(memcmp(temp,buf,len)==0)
+        {
+            j=i;
+            buf=buf+len+1;
+            break;
+        }
+    }
+    switch(j)
+    {
+    case0:
+        memcpy(server->servername,buf,strlen(buf)-1); //减一是不要'\n'符;
+        printf("服务器名称:%s\n",server->servername);
+        break;
+    case1:
+        memcpy(server->main_path,buf,strlen(buf)-1);
+        printf("工作路径:%s\n",server->main_path);
+        break;
+    case2:
+        memcpy(server->serverip,buf,strlen(buf)-1);
+        printf("服务器ip:%s\n",server->serverip);
+        break;
+    case3:
+        server->serverport=atoi(buf);
+        printf("服务器端口号:%d\n",server->serverport);
+        break;
+    case4:
+        if(!server->logchangeflag)
+               memcpy(server->log_path,buf,strlen(buf)-1);
+        printf("服务器日志路径:%s\n",server->log_path);
+        break;
+    case5:
+        server->processnum=atoi(buf);
+        printf("服务器子进程数量:%d\n",server->processnum);
+        break;
+    default:
+        perror("unkown   server_ini_info!");
+        return  -1;
+    }
+}
+ 
+/*
+ *扫描本地目录;
+ */
+char*  scan_local_dir(char*path)
+{
+    int   ret;
+    int   flag=0;
+    DIR   *dir;
+    structdirent  *dt;
+    dir=opendir(path);
+    if(dir==NULL)
+    {
+        perror("opendir");
+        return   NULL;
+    }
+    while((dt=readdir(dir))!=NULL)
+    {
+        ret=nameswitch(dt->d_name,"server.ini");
+        if(ret==1)
+        {
+            printf("找到了配置文件!\n");
+            sprintf(path+strlen(path),"/%s",dt->d_name);
+            closedir(dir);
+            returnpath;
+        }
+    }
+    if(flag==0)
+    {
+        printf("没有找到系统配置文件!\n");
+        return  NULL;
+    }
+}
+/*读取配置文件*/
+int   read_server_ini(struct  serverinfo  *server,char*path)
+{
+    FILE  *fd;
+    char  buf[BUFSIZE];
+    chdir("/");
+    fd=fopen(path,"a+");
+    if(fd==NULL)
+    {
+        perror("open error!\n");
+        return  -1;
+    }
+    while(fgets(buf,BUFSIZE,fd)!=NULL)
+    {
+        switch_server_ini(server,buf);
+    }
+    fclose(fd);
+}
+/*
+ *添加事件到epoll;
+ */
+int  add_epoll_event(struct  serverinfo  *server,int  sockfd,int  index,int  type)
+{
+    struct   epoll_event   event;
+    memset(&event,0,sizeof(event));
+    event.data.fd=sockfd;
+    event.events=EPOLLIN;
+    switch(type)
+    {
+    case  MASTER_PROCESS:
+        if(epoll_ctl(server->epfd,EPOLL_CTL_ADD,sockfd,&event)<0)
+        {
+            perror("epoll_ctl");
+            return  -1;
+        }
+        break;
+    case  WORKER_PROCESS:
+        if(epoll_ctl(server->process[index].epfd,EPOLL_CTL_ADD,sockfd,&event)<0)
+        {
+            perror("epoll_ctl");
+            return  -1;
+        }
+        break;
+    }
+    return   1;
+}
+ 
+/*初始化服务器*/
+ 
+struct  serverinfo  *server_init(struct  serverinfo *server,char*path,intargc,char**argv,char*startpath)
+{
+    int   opt=1;
+    int    i;
+    if(!(server=(struct  serverinfo *)calloc(1,sizeof(structserverinfo))))
+    {
+        perror("server_init  error");
+        free(server);
+        return  NULL;
+    }
+    memset(server,0,sizeof(struct  serverinfo));
+    //搞个读取配置文件函数接口;
+    master_process_para_args(server,argc,argv,startpath);
+    read_server_ini(server,path);
+ 
+    //下面就是各种初始化操作;
+    if(server->logchangeflag==0)
+    {
+        server->logfd=create_log_file(server,server->log_path,startpath);
+    }
+    server->listenfd=socket(AF_INET,SOCK_STREAM,0);
+    if(server->listenfd<0)
+    {
+        perror("server process create   socket   error!\n");
+        return  NULL;
+    }
+    server->serveraddr.sin_family=AF_INET;
+    server->serveraddr.sin_port=htons(server->serverport);
+    if(inet_aton(server->serverip,&server->serveraddr.sin_addr)<0)
+    {
+        perror("inet_aton");
+        returnNULL;
+    }
+    if(setsockopt(server->listenfd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt))<0)
+    {
+        perror("setsockopt");
+        returnNULL;
+    }
+    if(!(server->process=(struct   processinfo *)calloc(server->processnum,sizeof(struct  processinfo))))
+    {
+        perror("calloc  error");
+        free(server->process);
+        return  NULL;
+    }
+    server->currentprocessnum=0;
+    server->pid=getpid();
+    if(bind(server->listenfd,(structsockaddr *)&server->serveraddr,sizeof(server->serveraddr))<0)
+    {
+        perror("bind");
+        return  NULL;
+    }
+    if(listen(server->listenfd,BACKLOG)<0)
+    {
+        perror("listen");
+        return   NULL;
+    }
+    return   server;
+}
+ 
+/*
+ *设置成为非阻塞;
+ */
+int  setsocketnonblocking(int   socket)
+{
+    int  flag;
+    if((flag=fcntl(socket,F_GETFL,0))<0)
+    {
+        perror("fcntl");
+        return  -1;
+    }
+    flag|=O_NONBLOCK;
+    if(fcntl(socket,F_SETFL,flag)<0)
+    {
+        perror("fcntl");
+        return  -1;
+    }
+    return  1;
+}
+/*
+ *设置执行exec后关闭fd
+ */
+int  setsocketexecclose(int  socket)
+{
+    int  flag;
+    if((flag=fcntl(socket,F_GETFD,0))<0)
+    {
+        perror("fcntl");
+        return  -1;
+    }
+    flag|=FD_CLOEXEC;
+    if(fcntl(socket,F_SETFD,flag)<0)
+    {
+        perror("fcntl");
+        return  -1;
+    }
+    return  1;
+}
+/*
+ *在当前进程表中查找空闲位置;
+ */
+int  find_worker_process_idle(struct  serverinfo  * server)
+{
+    int  i;
+    for(i=0;i<server->processnum;i++)
+    {
+        if(server->process[i].channel[0]==0||server->process[i].channel[1]==0)
+        {
+            return   i;
+        }
+        else
+            continue;
+    }
+}
+/*
+ *master进程把套接字主动告知给前面生成的worker进程;
+ *
+ */
+int   send_socket_to_other_worker_process(struct  serverinfo  * server,int  index,int  processnum)
+{
+    int  i,j;
+    struct   command   msg;
+    memset(&msg,0,sizeof(msg));
+    for(i=0;i<processnum;i++)
+    {  
+        if(i==index)
+            break;
+        else
+        {
+            for(j=0;j<2;j++)
+            {
+                msg.type=SEND_FILE_DES;
+                msg.fd=server->process[index].channel[j];
+                send_socketfd_to_workerprocess(server,i,&msg,sizeof(msg));
+            }
+        }
+    }
+    return  1;
+}
+ 
+/*
+ *worker进程一直等待所有进程表信息都填充完成后退出;
+ */
+int   worker_process_recv_socket(struct  serverinfo  *server,intindex)
+{
+    struct   command  msg;
+    memset(&msg,0,sizeof(msg));
+    recv_socketfd_from_masterprocess(server,index,&msg,sizeof(msg));
+    return  1;
+}
+ 
+/*
+ *worker进程循环处理函数接口;
+ */
+void   worker_process_cycle_handler(void  *data)
+{
+    int  *index=(int*)data;
+    struct   epoll_event   event[EPOLL_EVENT_MAXSiZE];
+    int  nfds,i;
+    while(1)
+    {
+        nfds=epoll_wait(server->process[*index].epfd,event,EPOLL_EVENT_MAXSiZE,-1);
+        if(nfds==-1)
+        {
+            if(errno!=EINTR)
+            {
+                continue;
+            }
+            //调用信号处理函数;
+ 
+        }
+        else
+        {
+            for(i=0;i<nfds;i++)
+            {
+                if(event[i].data.fd==server->process[*index].channel[0])
+                {
+                    //process发过来的,那就是命令或者信号变成守护进程时;
+                    worker_process_recv_comm_signal_handler(server,*index);
+                }
+                elseif(event[i].data.fd==server->listenfd)
+                {
+                     //接收连接;
+                     worker_process_handler(server,*index);     
+                }
+                else
+                {   
+                    //这边是处理数据传输之类的任务;
+ 
+                }
+            }
+ 
+        }
+    }
+ 
+}
+ 
+/*
+ *初始化worker进程接口;
+ */
+int   init_worker_process(structserverinfo  *server,intindex)
+{
+    server->process[index].pid=getpid();
+    //要不要把worker进程绑定到CPU上;
+    server->process[index].slot=index;
+    server->process[index].mem_pool=mempool_init(server->process[index].mem_pool,PAGE_SIZE);
+    server->process[index].epfd=epoll_create(BACKLOG);
+    if(server->process[index].epfd<0)
+    {
+        perror("epoll_create");
+        return  -1;
+    }
+    add_epoll_event(server,server->process[index].channel[0],index,WORKER_PROCESS);
+    add_epoll_event(server,server->listenfd,index,WORKER_PROCESS);  
+    queue_init(server->process[index].head,index);
+    sigemptyset(&server->process[index].set);
+    if(sigprocmask(SIG_SETMASK,&server->process[index].set,NULL)<0)
+    {
+        perror("sigprocmask");
+        return  -1;
+    }
+    if(!(server->process[index].pool=(structconnect_pool*)calloc(1,sizeof(struct  connect_pool))))
+    {
+        perror("worker process create connectionpool error\n");
+        free(server->process[index].pool);
+        return  -1;
+    }
+    server->process[index].pool->slot=0;
+    server->process[index].pool->connectnum=MAX_CONNECT_POOL;
+ 
+    server->process[index].pool=connect_pool_init(server->process[index].pool,getpid());
+    //调用这个worker进程的回调函数-----目的是循环处理连接任务。
+    //把我的套接字主动告知给前面的生成的worker进程;接收完成后继续;
+    if(index==server->processnum-1)
+       server->process[index].recvflag=1;
+    else
+       server->process[index].recvflag=0;
+    worker_process_cycle_handler((void*)&index);
+    return  1;
+}
+ 
+/*
+ *创建各个子进程函数;
+ */
+int   create_worker_process(struct  serverinfo  *server)
+{
+    pid_t  pid;
+    int    index;
+    int    i;
+    for(i=0;i<server->processnum;i++)
+    {
+        //查找空闲位置用于填充worker进程的信息;
+        index=find_worker_process_idle(server);
+        if(socketpair(AF_LOCAL,SOCK_STREAM,0,server->process[index].channel)<0)
+        {
+            perror("socketpair");
+            return  -1;
+        }
+        setsocketnonblocking(server->process[index].channel[0]);
+        setsocketexecclose(server->process[index].channel[0]);
+        setsocketnonblocking(server->process[index].channel[1]);
+        setsocketexecclose(server->process[index].channel[1]);
+        pid=fork();
+        switch(pid)
+        {
+        case-1:
+            perror("fork error");
+            break;
+        case  0:
+            //worker进程的初始化函数接口;
+            init_worker_process(server,index);
+            break;
+        default:
+            server->process[index].pid=pid;
+            server->process[index].slot=index;
+            //把我的套接字主动告知给前面的生成的worker进程;
+            ++server->currentprocessnum;
+            send_socket_to_other_worker_process(server,index,server->currentprocessnum);
+            break;
+        }
+    }
+}
+/*把子进程中的channel[1]端加入到进程表中;*/
+int  register_master_process_epfd(struct  serverinfo   *server,int  type)
+{
+    int  i;
+    for(i=0;i<server->processnum;i++)
+    {
+        add_epoll_event(server,server->process[i].channel[1],i,MASTER_PROCESS);
+    }
+}
+ 
+intcommand_and_signo_send(struct  serverinfo *server,struct  command   *comm,size_tsize)
+{
+    int  i;
+    for(i=0;i<server->processnum;i++)
+    {
+        write(server->process[i].channel[1],comm,size);
+    }
+}
+ 
+/*master进程接收到我们发送过去的信号或者命令都转发给我们的worker进程*/
+int  send_signo_command_to_workerprocess(structserverinfo  *server,intmsgcode)
+{
+    struct   command   comm;
+    size_t   size=sizeof(comm);
+    memset(&comm,0,size);
+    switch(msgcode)
+    {
+    case  SIGINT:
+        comm.type=SEND_SIG_NO;
+        comm.msgcode=msgcode;
+        comm.name="SIGINT";
+        break;
+    case  SIGQUIT:
+        comm.type=SEND_SIG_NO;
+        comm.msgcode=msgcode;
+        comm.name="SIGQUIT";
+        break;
+    case  COMM_RESTART:
+        comm.type=SERVER_COMM;
+        comm.msgcode=msgcode;
+        comm.name="RESTART";
+        break;
+    case  COMM_DISPLAY_SERVER:
+        //返回服务器当前的信息;
+        break;
+    default:
+        perror("master 主进程收到了未知指令!\n");
+        return  -1;
+    }
+    command_and_signo_send(server,&comm,size);
+    return   1;
+}
+/*
+ *系统退出处理;
+ *
+ */
+int  server_exit_handler(struct  serverinfo  * server)
+{
+    int  i;
+    int    status;
+    int    ret;
+    for(i=0;i<server->processnum;i++)
+    {
+        ret=waitpid(-1,&status,WNOHANG);
+        if(ret<0)
+            return  -1;
+        else
+        {
+            continue;
+        }
+    }
+    //最后释放本地master进程资源;
+    printf("it's  over!\n");
+    close(server->epfd);
+    close(server->listenfd);
+    close(server->file.fd);
+    close(server->logfd);
+    close(server->file.fd);
+    free(server->process);
+    free(server);
+    exit(0);
+}
+ 
+ 
+/*
+ *主函数;
+ */
+int  main(int  argc,char**argv)
+{
+    int  ret;
+    char  current_work_path[BUFSIZE];
+    char  *server_ini_file=NULL;
+    getcwd(current_work_path,BUFSIZE);
+    server_ini_file=scan_local_dir(current_work_path);
+    if(server_ini_file==NULL)
+    {
+        perror("没有找到相应的配置文件!系统错误!\n");
+        return  0;
+    }
+    server=server_init(server,server_ini_file,argc,argv,current_work_path);
+    signal_set_init(&server->act);
+    server_open_file_mutex(&server->file);  
+    add_signal_to_master_process_set(&server->set);
+    //初始化子进程函数;
+#ifndef  _DAEMONE_
+    server_daemon();
+#endif
+    create_worker_process(server);
+    //这边开始创建master进程的epfd;
+    server->epfd=epoll_create(EPOLL_EVENT_MAXSiZE);
+    if(server->epfd<0)
+    {
+        perror("epoll_create");
+        return  -1;
+    }
+    //把子进程的channel[1]端加入到epfd中;
+    register_master_process_epfd(server,MASTER_PROCESS);
+    while(1)
+    {
+ 
+        //让master主进程挂起;
+        sigsuspend(&server->set);
+        if(sigquit)
+        {
+            ret=send_signo_command_to_workerprocess(server,SIGQUIT);
+            server_exit_handler(server);
+            sigquit=0;
+        }
+        if(sigint)
+        {
+            ret=send_signo_command_to_workerprocess(server,SIGINT);
+            sigint=0;
+        }  
+        if(comdisplay)
+        {
+            send_signo_command_to_workerprocess(server,COMM_DISPLAY_SERVER);
+            comdisplay=0;
+        }
+        if(comrestart)
+        {
+            send_signo_command_to_workerprocess(server,COMM_RESTART);
+            comrestart=0;
+        }
+    }
+    return  1;
+}
+16. [文件] connect.c ~ 4KB     下载(5)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+152
+153
+154
+155
+156
+157
+158
+159
+160
+161
+162
+163
+164
+165
+166
+167
+168
+169
+170
+171
+#include"connect.h"
+#include"server.h"
+#include"mempool.h"
+/*初始化一个连接池的空闲节点链表*/
+connectlist  *  init_conn_pool_queue(struct  serverinfo *server,intindex,structconnect_pool *pool)
+{
+    if(!(pool->freeconnhead=(connectlist *)mempool_alloc(server->process[index].mem_pool,sizeof(connectlist))))
+    {
+        perror("init failure!\n");
+        return  NULL;
+    }
+    pool->freeconnhead->next=pool->freeconnhead;
+    return   pool->freeconnhead;
+}
+ 
+/*添加一个空闲连接点进入到链表*/
+int   add_connect_node_to_bufflist(struct  connect_pool * pool,connectlist  * conn)
+{
+    connectlist  * tail=pool->freeconnhead;
+    switch(conn->status)
+    {
+    case   SOCKET_CLOSING://判断是不是连接关闭状态;
+        //空闲节点的信息全部清空;
+        pool->conn[conn->index]=NULL;
+        memset(conn,0,sizeof(connectlist));
+        tail->next=conn;
+        conn->next=pool->freeconnhead;
+        tail=conn;
+        pool->connnum++;
+        printf("空闲节点插入空闲链表成功!\n");
+        break;
+    default:
+        printf("the  connection node  stauts  is  not   socket_closing!\n");
+        return  -1;
+    }
+ 
+}
+ 
+/*初始化连接池*/
+struct  connect_pool *connect_pool_init(structserverinfo *server ,int  index,struct connect_pool *pool,int  pid)
+{
+ 
+    int   i;
+    if(!(pool->conn=(connectlist **)calloc(pool->connectnum,sizeof(connectlist *))))
+    {
+        perror("worker connectionpool  init  error");
+        return   NULL;
+    }
+    memset(pool->conn,0,sizeof(connectlist *)*pool->connectnum);
+    printf("PID:%dworker进程连接池初始化成功!\n",pid);
+    pool->freeconnhead=init_conn_pool_queue(server,index,pool);
+    pool->slot=0;
+    return  pool;
+}
+ 
+/*连接池的扩容*/
+struct   connect_pool *  connect_pool_realloc(structconnect_pool  *pool)
+{
+    inta=pool->connectnum;
+    connectlist   **newconn;
+    if(pool->slot>=pool->connectnum)
+    {
+        while(pool->slot>=pool->connectnum)
+        {
+            pool->connectnum=pool->connectnum*2;
+        }
+        newconn=(connectlist **)realloc(pool->conn,pool->connectnum*sizeof(connectlist *));
+        if(!newconn)
+            return   NULL;
+        else
+        {
+            pool->conn=newconn;
+            memset(pool->conn+a,0,(pool->connectnum-a)*sizeof( connectlist *));
+            return   pool;
+        }
+    }
+}
+ 
+/*从空闲中取出一个节点出来*/
+connectlist * get_connection_from_free_pool(struct  connect_pool  *pool,connectlist *conn)
+{
+    int     i;
+    for(i=0;i<pool->connectnum;i++)
+    {
+        if(!pool->conn[i])
+        {
+            if(conn)
+            {
+                //这个是一个空闲节点;
+                pool->conn[i]=conn;
+                conn->index=i;
+                return  conn;
+            }
+            else
+            {
+                conn=pool->conn[i];
+                pool->slot=i;
+                return  conn;
+            }
+        }
+    }
+    if(pool->slot>=pool->connectnum)
+    {
+        //不够了  我们就扩容吧;
+        pool=connect_pool_realloc(pool);
+        conn=pool->conn[pool->slot++];
+        return  conn;
+    }
+}
+/*从空闲节点链表中取出一个空闲节点出来存放连接节点信息*/
+connectlist  *  find_free_node_from_connectfreelist(struct  connect_pool *pool)
+{
+    connectlist  *  p;
+    connectlist  *  q;
+    p=pool->freeconnhead;
+    q=p->next;
+    if(q!=p)
+    {
+        p->next=q->next;
+        pool->connnum--;
+        return  q;
+    }
+    return  NULL;
+}
+ 
+/*新建一个连接*/
+voidnew_create_connect(struct  serverinfo  *server,intindex,struct  connect_pool  *pool,int  fd,int  status)
+{
+    connectlist  *conn;
+    connectlist  *temp=pool->freeconnhead;
+    if(temp->next!=pool->freeconnhead)
+    {
+        conn=find_free_node_from_connectfreelist(pool);
+        //如果找到空闲节点,conn!=NULL;
+        //否则的话,conn==NULL;
+    }
+    conn=get_connection_from_free_pool(pool,conn);
+    if(conn!=NULL)
+    {
+        conn->socket=fd;
+        conn->status=status;
+    }
+    else
+    {
+        if(!(conn=(connectlist *)mempool_alloc(server->process[index].mem_pool,sizeof(connectlist))))
+        {
+            perror("malloc  errror");
+        }
+        pool->conn[pool->slot]=conn;
+        //这个地方要把连接节点的信息给初始化下;
+        conn->socket=fd;        //连接描述字;
+        conn->index=pool->slot; //如果这个连接失效的话,我就直接根据索引号找到它在我那个数组表中的位置;
+        conn->status=status;   
+        pool->slot++;
+    }
+}
+ 
+/*当一个连接关闭了的时候我们是否应该把连接再还回去*/
+ 
+ 
+ 
+ 
+ 
+ 
+/*销毁连接池*/
+void  destroy_worker_process_conn_pool(struct   connect_pool *pool)
+{
+ 
+    free(pool->conn);
+    free(pool);
+}
+17. [文件] connect.h ~ 2KB     下载(5)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+#ifndef _CONNECT_H__
+#define _CONNECT_H__
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<time.h>
+#include"server.h"
+#define  MAX_CONNECT_POOL   100
+ 
+#define  FIRST_MALLOC       0x01
+#define  FREE_FIND          0x02
+ 
+enumstatus
+{
+    WAIT_LISTENING,
+    DATA_READING,
+    DATA_WRITING,
+    SOCKET_CLOSING
+};
+//状态机机制;
+/*
+ *一个连接的定义;
+ *
+ *
+ */
+typedef   struct  connection
+{
+    int    socket;   //连接套接字;
+    int    status;   //状态;
+    char   client_addr[50];//ip地址;
+    int    port;       //端口号;
+    int    index;     //该连接在连接池里的下标索引号;
+    struct  timeval  timeouttv;   //超时时间; 这边有点让我头疼;难道要用个小根堆来解决超时问题？？？？？？？
+    struct  timeval  starttv; //连接建立时间;
+    struct    connection *  next; //这个指针域是在节点释放的时候 我才会去用;
+    //下面定义对应的事件吧;回调函数实现;event.h结构体中
+}connectlist;
+ 
+/*
+ *连接池定义;
+ *这个连接池主要就是一个索引表,相应的指针节点指向一个连接节点,如果连接节点失效,节点我不释放,清空节点后
+ *加入到连接池中的空闲节点链表中去;
+ *所以我也改了一部分东西;
+ */
+struct   connect_pool
+{
+    connectlist    **conn;     //连接池的索引表; 可以用哈希表代替吧;
+    int        slot;      //当前连接池的下标索引;
+    int       connectnum; //连接池的最大容量;
+    connectlist  * freeconnhead;//当前的空闲节点链表;       
+    int         connnum; //当前空闲节点数目;
+};
+ 
+ 
+struct  connect_pool *connect_pool_init(structserverinfo  *server,intindex,struct  connect_pool *pool,int  pid);
+struct   connect_pool * connect_pool_realloc(structconnect_pool  *pool);
+connectlist *  get_connection_from_free_pool(struct  connect_pool  *pool,connectlist  *conn);
+void(*callback)(struct  serverinfo * ,int  ,struct  connect_pool *,int,int);
+void  destroy_worker_process_conn_pool(struct   connect_pool *pool);
+int   add_connect_node_to_bufflist(struct  connect_pool * pool,connectlist  * conn);
+connectlist  *  find_free_node_from_connectfreelist(struct  connect_pool *pool);
+ 
+#endif
+18. [文件] event.c ~ 822B     下载(4)     
+
+?
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+#include"event.h"
+#include"file_mutex.h"
+#include"connect.h"
+/*
+ *处理新的连接;
+ */
+intworker_process_handler(struct  serverinfo  *server,int  index)
+{
+   struct   sockaddr_in   clientaddr;
+   int    fd;
+   connectlist   * conn; 
+   socklen_t   clielen;
+   clielen=sizeof(clientaddr);
+   memset(&clientaddr,0,sizeof(struct  sockaddr_in));
+   //获取锁的情况下;调用accept接收连接;
+   worker_process_lock_set(&server->file);
+   //释放锁;
+   fd=accept(server->listenfd,(structsockaddr *)&clientaddr,&clielen);
+   if(fd<0)
+   {
+       perror("accept error!");
+   }
+   //正常情形下我应该从连接池里拿出一个连接出来给我这个新的连接;
+   worker_process_unlock_set(&server->file);
+   new_create_connect(server,index,server->process[index].pool,fd,WAIT_LISTENING);
+   return   1;
+}

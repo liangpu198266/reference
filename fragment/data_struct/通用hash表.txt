@@ -1,0 +1,303 @@
+头文件：
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+#ifndef _COMM_HASH_H_ 
+#define _COMM_HASH_H_ 
+
+/********************************************************************** 
+* comm_list.h 
+* 
+* liangpu <liangpu198266@163.com> 
+* Time-build: <2014:22:49> 
+* Description: 
+***********************************************************************/ 
+
+#ifndef offsetof 
+#ifdef __compiler_offsetof 
+#define offsetof(TYPE,MEMBER) __compiler_offsetof(TYPE,MEMBER) 
+#else 
+#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER) 
+#endif 
+#endif 
+
+#define container_of(ptr, type, member) ({	 \ 
+const typeof( ((type *)0)->member ) *__mptr = (ptr);	\ 
+(type *)( (char *)__mptr - offsetof(type,member) );}) 
+
+
+struct hlist_head { 
+struct hlist_node *first; 
+}; 
+
+struct hlist_node { 
+struct hlist_node *next, **pprev; 
+}; 
+
+#define LIST_POISON1 NULL 
+#define LIST_POISON2 NULL 
+
+#define HLIST_HEAD_INIT { .first = NULL } 
+#define HLIST_HEAD(name) struct hlist_head name = { .first = NULL } 
+#define INIT_HLIST_HEAD(ptr) ((ptr)->first = NULL) 
+static inline void INIT_HLIST_NODE(struct hlist_node *h) 
+{ 
+h->next = NULL; 
+h->pprev = NULL; 
+} 
+
+static inline int hlist_unhashed(const struct hlist_node *h) 
+{ 
+return !h->pprev; 
+} 
+
+static inline int hlist_empty(const struct hlist_head *h) 
+{ 
+return !h->first; 
+} 
+
+static inline void __hlist_del(struct hlist_node *n) 
+{ 
+struct hlist_node *next = n->next; 
+struct hlist_node **pprev = n->pprev; 
+*pprev = next; 
+if (next) 
+next->pprev = pprev; 
+} 
+
+static inline void hlist_del(struct hlist_node *n) 
+{ 
+__hlist_del(n); 
+n->next = LIST_POISON1; 
+n->pprev = LIST_POISON2; 
+} 
+
+static inline void hlist_del_init(struct hlist_node *n) 
+{ 
+if (!hlist_unhashed(n)) { 
+__hlist_del(n); 
+INIT_HLIST_NODE(n); 
+} 
+} 
+
+static inline void hlist_add_head(struct hlist_node *n, struct hlist_head *h) 
+{ 
+struct hlist_node *first = h->first; 
+n->next = first; 
+if (first) 
+first->pprev = &n->next; 
+h->first = n; 
+n->pprev = &h->first; 
+} 
+
+/* next must be != NULL */ 
+static inline void hlist_add_before(struct hlist_node *n, 
+struct hlist_node *next) 
+{ 
+n->pprev = next->pprev; 
+n->next = next; 
+next->pprev = &n->next; 
+*(n->pprev) = n; 
+} 
+
+static inline void hlist_add_after(struct hlist_node *n, 
+struct hlist_node *next) 
+{ 
+next->next = n->next; 
+n->next = next; 
+next->pprev = &n->next; 
+
+if(next->next) 
+next->next->pprev = &next->next; 
+} 
+
+/* after that we'll appear to be on some hlist and hlist_del will work */ 
+static inline void hlist_add_fake(struct hlist_node *n) 
+{ 
+n->pprev = &n->next; 
+} 
+
+/* 
+* Move a list from one list head to another. Fixup the pprev 
+* reference of the first entry if it exists. 
+*/ 
+static inline void hlist_move_list(struct hlist_head *old, 
+struct hlist_head *new) 
+{ 
+new->first = old->first; 
+if (new->first) 
+new->first->pprev = &new->first; 
+old->first = NULL; 
+} 
+
+#define hlist_entry(ptr, type, member) container_of(ptr,type,member) 
+
+#define hlist_for_each(pos, head) \ 
+for (pos = (head)->first; pos ; pos = pos->next) 
+
+#define hlist_for_each_safe(pos, n, head) \ 
+for (pos = (head)->first; pos && ({ n = pos->next; 1; }); \ 
+pos = n) 
+
+/** 
+* hlist_for_each_entry	- iterate over list of given type 
+* @tpos:	the type * to use as a loop cursor. 
+* @pos:	the &struct hlist_node to use as a loop cursor. 
+* @head:	the head for your list. 
+* @member:	the name of the hlist_node within the struct. 
+*/ 
+#define hlist_for_each_entry(tpos, pos, head, member)	 \ 
+for (pos = (head)->first;	 \ 
+pos &&	 \ 
+({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \ 
+pos = pos->next) 
+
+/** 
+* hlist_for_each_entry_continue - iterate over a hlist continuing after current point 
+* @tpos:	the type * to use as a loop cursor. 
+* @pos:	the &struct hlist_node to use as a loop cursor. 
+* @member:	the name of the hlist_node within the struct. 
+*/ 
+#define hlist_for_each_entry_continue(tpos, pos, member)	 \ 
+for (pos = (pos)->next;	 \ 
+pos &&	 \ 
+({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \ 
+pos = pos->next) 
+
+/** 
+* hlist_for_each_entry_from - iterate over a hlist continuing from current point 
+* @tpos:	the type * to use as a loop cursor. 
+* @pos:	the &struct hlist_node to use as a loop cursor. 
+* @member:	the name of the hlist_node within the struct. 
+*/ 
+#define hlist_for_each_entry_from(tpos, pos, member)	 \ 
+for (; pos &&	 \ 
+({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \ 
+pos = pos->next) 
+
+/** 
+* hlist_for_each_entry_safe - iterate over list of given type safe against removal of list entry 
+* @tpos:	the type * to use as a loop cursor. 
+* @pos:	the &struct hlist_node to use as a loop cursor. 
+* @n:	 another &struct hlist_node to use as temporary storage 
+* @head:	the head for your list. 
+* @member:	the name of the hlist_node within the struct. 
+*/ 
+#define hlist_for_each_entry_safe(tpos, pos, n, head, member) \ 
+for (pos = (head)->first;	 \ 
+pos && ({ n = pos->next; 1; }) && \ 
+({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \ 
+pos = n) 
+
+
+#endif 
+
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+测试文件
+
+#include <stdlib.h>
+#include <malloc.h>        
+#include "comm_hash.h"    
+#include <memory.h>    
+#include <string.h>
+
+struct q_coef
+{
+    unsigned char coef;
+    unsigned char index;
+    struct hlist_node hash;
+};
+
+#define HASH_NUMBER 15
+unsigned char coef[HASH_NUMBER] = {
+    0x01, 0x02, 0x04, 0x08,0x10, 0x20, 0x40, 0x80, 0x1d, 0x3a, 0x74, 0xe8, 0xcd, 0x87, 0x13,
+};
+struct q_coef q_coef_list[HASH_NUMBER];
+
+struct hlist_head hashtbl[HASH_NUMBER];
+
+static inline int hash_func(unsigned char k)
+{
+    int a, b, p, m;
+    a = 104;
+    b = 52;
+    p = 233;
+    m = HASH_NUMBER;
+    return ((a * k + b) % p) % m;
+}
+
+static void hash_init(void)
+{
+    int i, j;
+    for (i = 0 ; i < HASH_NUMBER ; i++) {
+        INIT_HLIST_HEAD(&hashtbl[i]);
+        INIT_HLIST_NODE(&q_coef_list[i].hash);
+        q_coef_list[i].coef = coef[i];
+        q_coef_list[i].index = i + 1;
+    }
+    for (i = 0 ; i < HASH_NUMBER ; i++) {
+        j = hash_func(q_coef_list[i].coef);//自己制定的碰撞算法
+        hlist_add_head(&q_coef_list[i].hash, &hashtbl[j]);
+    }
+}
+
+static void hash_test(void)
+{
+    int i, j;
+    struct q_coef *q;
+    struct hlist_node *hn;
+    for (i = 0 ; i < HASH_NUMBER ; i++) {
+        j = hash_func(coef[i]);
+        hlist_for_each_entry(q, hn, &hashtbl[j], hash)
+            if (q->coef == coef[i])
+                printf("found: coef=0x%02x index=%d\n", q->coef, q->index);
+    }
+}
+int main(void)  
+{
+    hash_init();
+    hash_test();
+    return -1;
+}
+===========================================================
+具体分析
+参考了一些内核中应用散列的实例才发现，原来根本不是这么回事。实际
+上，对于如何将输入数据散列到一个指定范围的算法，需要使用散列的人自己决
+定。内核只提供了一个发射碰撞时把碰撞的项链接到一起的hlist结构。
+
+例如，你创建了一个长度为m的散列表，并且已经选择了一个将输入数据映射到
+范围0 ~ m-1的散列函数。接下来，你就要在这个长度为m的散列表的每个表项内
+放上一个hlist_head结构体。然后在每个输入数据的结构体中定义一个
+hlist_node的结构体。每当把一个输入通过散列函数映射到0 ~ m-1的范围内时，就
+把这个输入的hlist_node挂到散列表对应的槽的hlist_head上面。当给定一个
+key，想获取它的value的时候，就先用散列函数算出这个key对应的槽的位置，
+然后遍历这个槽的hlist_node链表，找到与key相等的项。把它的value返回。
+
+例如，有这样一个数组：
+0x01, 0x02, 0x04, 0x08,0x10, 0x20, 0x40, 0x80, 0x1d, 0x3a, 0x74, 0xe8,
+0xcd, 0x87, 0x13,
+其中每个元素对应的索引号为：
+1, 2, 3, 4, 5, ... 15
+也就是说，当输入0x01时，我希望得到索引号1，当输入0x08时，得到4，当输入
+0x3a时，得到10...
+这种从数值到索引号的转换，可通过散列来实现。
+
+下面是实现该功能的一个内核代码，散列函数我选择的是：
+value = ((104 * key + 52) % 233) % 15
+(实际上，对于输入固定的情况，使用完全散列可以获得完全固定的访问时间，
+上面这个散列函数就是我想使用完全散列时搜索一个全域散列族得到的第一级散
+列函数，但我发先这个散列函数已经足够好，总共才只有一次碰撞。所以就没有
+必要像完全散列那样使用二级散列了。)
+
+
+============================================================
+字符的hash构造：
+u_int sekey_hosthash(char *str)
+{
+    unsigned int hash = 0;
+ 
+    while (*str)
+    {
+        hash = (*str++) + (hash << 6) + (hash << 16) - hash;
+    }
+ 
+    return (hash & 0x6FF); //hash表最大值为0x6ff+1,这里可以自己定义
+}
